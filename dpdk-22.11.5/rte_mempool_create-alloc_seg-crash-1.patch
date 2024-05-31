@@ -1,0 +1,11 @@
+--- lib/eal/common/eal_common_fbarray.c.org	2024-05-15 19:07:11.352908574 +0300
++++ lib/eal/common/eal_common_fbarray.c	2024-05-15 19:08:20.449006479 +0300
+@@ -173,7 +173,7 @@
+ 
+ 		/* combine current ignore mask with last index ignore mask */
+ 		if (msk_idx == last)
+-			ignore_msk |= last_msk;
++			cur_msk &= last_msk;
+ 
+ 		/* if we have an ignore mask, ignore once */
+ 		if (ignore_msk) {
