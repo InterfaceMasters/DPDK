@@ -1,0 +1,27 @@
+diff --git a/drivers/net/i40e/base/i40e_adminq_cmd.h b/drivers/net/i40e/base/i40e_adminq_cmd.h
+index def307b..709ba78 100644
+--- a/drivers/net/i40e/base/i40e_adminq_cmd.h
++++ b/drivers/net/i40e/base/i40e_adminq_cmd.h
+@@ -2800,7 +2800,7 @@ struct i40e_aqc_add_udp_tunnel {
+ 	u8	reserved0[3];
+ 	u8	protocol_type;
+ #define I40E_AQC_TUNNEL_TYPE_VXLAN	0x00
+-#define I40E_AQC_TUNNEL_TYPE_NGE	0x01
++#define I40E_AQC_TUNNEL_TYPE_GENEVE	0x01
+ #define I40E_AQC_TUNNEL_TYPE_TEREDO	0x10
+ #define I40E_AQC_TUNNEL_TYPE_VXLAN_GPE	0x11
+ 	u8	reserved1[10];
+diff --git a/drivers/net/i40e/i40e_ethdev.c b/drivers/net/i40e/i40e_ethdev.c
+index cb0070f..464e0be 100644
+--- a/drivers/net/i40e/i40e_ethdev.c
++++ b/drivers/net/i40e/i40e_ethdev.c
+@@ -8753,6 +8753,9 @@ i40e_dev_udp_tunnel_port_add(struct rte_eth_dev *dev,
+ 					  I40E_AQC_TUNNEL_TYPE_VXLAN_GPE);
+ 		break;
+ 	case RTE_ETH_TUNNEL_TYPE_GENEVE:
++		ret = i40e_add_vxlan_port(pf, udp_tunnel->udp_port,
++					  I40E_AQC_TUNNEL_TYPE_GENEVE);
++		break;
+ 	case RTE_ETH_TUNNEL_TYPE_TEREDO:
+ 		PMD_DRV_LOG(ERR, "Tunnel type is not supported now.");
+ 		ret = -1;
