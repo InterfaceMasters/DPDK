@@ -1,0 +1,72 @@
+From 831fbde93b79b00a251772b4efe15459fc7cacaf Mon Sep 17 00:00:00 2001
+From: Stephen Hemminger <stephen@networkplumber.org>
+Date: Fri, 14 Nov 2025 10:52:40 -0800
+Subject: [PATCH] net/bnxt: fix unintialized warning
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+With gcc-16 it inlines a lot more code and creates a warnings
+where it thinks it might be manipulating bits that are not set.
+It looks like this is because the bits in control word (cword)
+in theory could be larger than the variable. Should not
+be possible because wc_ctl_size_bits is only set to 3, 16, or 32
+but that happens outside of the scope of these functions.
+
+Resolve by adding bounds check which compiler sees and knows
+the loop will only see those bits.
+
+In function ‘ulp_bs_push_msb’,
+    inlined from ‘ulp_blob_push’ at ../drivers/net/bnxt/tf_ulp/ulp_utils.h:407:8,
+    inlined from ‘ulp_blob_push_32’ at ../drivers/net/bnxt/tf_ulp/ulp_utils.h:551:7,
+    inlined from ‘ulp_mapper_wc_tcam_tbl_dyn_post_process’ at ../drivers/net/bnxt/tf_ulp/ulp_mapper.c:2487:9:
+../drivers/net/bnxt/tf_ulp/ulp_utils.h:336:17: warning: ‘cword’ may be used uninitialized [-Wmaybe-uninitialized]
+  336 |                 ulp_bs_put_msb(bs, pos, 8, val[i]);
+      |                 ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+../drivers/net/bnxt/tf_ulp/ulp_mapper.c: In function ‘ulp_mapper_wc_tcam_tbl_dyn_post_process’:
+../drivers/net/bnxt/tf_ulp/ulp_mapper.c:2443:18: note: ‘cword’ declared here
+ 2443 |         uint32_t cword, i, rc;
+      |                  ^~~~~
+
+Bugzilla ID: 1821
+Fixes: 3fe124d2536c ("net/bnxt: support Thor platform")
+Cc: stable@dpdk.org
+
+Signed-off-by: Stephen Hemminger <stephen@networkplumber.org>
+Acked-by: Ajit Khaparde <ajit.khaparde@broadcom.com>
+---
+ drivers/net/bnxt/tf_ulp/ulp_mapper.c     | 5 +++++
+ drivers/net/bnxt/tf_ulp/ulp_mapper_tfc.c | 4 ++++
+ 2 files changed, 9 insertions(+)
+
+diff --git a/drivers/net/bnxt/tf_ulp/ulp_mapper.c b/drivers/net/bnxt/tf_ulp/ulp_mapper.c
+index 0ff952950b9..960cdda3114 100644
+--- a/drivers/net/bnxt/tf_ulp/ulp_mapper.c
++++ b/drivers/net/bnxt/tf_ulp/ulp_mapper.c
+@@ -2446,6 +2446,11 @@ ulp_mapper_wc_tcam_tbl_dyn_post_process(struct bnxt_ulp_device_params *dparms,
+ 
+ 	slice_width = dparms->wc_slice_width;
+ 	clen = dparms->wc_ctl_size_bits;
++	if (clen > 32) {
++		BNXT_DRV_DBG(ERR, "Key size bits %d too large\n", clen);
++		return -EINVAL;
++	}
++
+ 	max_slices = dparms->wc_max_slices;
+ 	blen = ulp_blob_data_len_get(key);
+ 
+diff --git a/drivers/net/bnxt/tf_ulp/ulp_mapper_tfc.c b/drivers/net/bnxt/tf_ulp/ulp_mapper_tfc.c
+index f99698a1d8b..2d89f10d5e8 100644
+--- a/drivers/net/bnxt/tf_ulp/ulp_mapper_tfc.c
++++ b/drivers/net/bnxt/tf_ulp/ulp_mapper_tfc.c
+@@ -90,6 +90,10 @@ ulp_mapper_tfc_wc_tcam_post_process(struct bnxt_ulp_device_params *dparms,
+ 
+ 	slice_width = dparms->wc_slice_width;
+ 	clen = dparms->wc_ctl_size_bits;
++	if (clen > 32) {
++		BNXT_DRV_DBG(ERR, "Key size bits %d too large\n", clen);
++		return -EINVAL;
++	}
+ 	max_slices = dparms->wc_max_slices;
+ 	blen = ulp_blob_data_len_get(key);
+ 

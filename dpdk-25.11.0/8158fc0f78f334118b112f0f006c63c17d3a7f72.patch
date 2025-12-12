@@ -1,0 +1,63 @@
+From 8158fc0f78f334118b112f0f006c63c17d3a7f72 Mon Sep 17 00:00:00 2001
+From: Manish Kurup <manish.kurup@broadcom.com>
+Date: Thu, 4 Dec 2025 17:13:03 -0500
+Subject: [PATCH] net/bnxt: fix a segmentation fault
+
+Fix a segmentation fault root-caused to the following
+
+1. bnxt testpmd queries the THOR2 capabilities using an HWRM.
+2. Another HWRM is made that overwrites the capabilities context,
+   which results in the MPC context not being created.
+3. Initializing TruFlow (which depends on the MPC context),
+   results in a SEGV.
+
+The fix moves the 2nd HWRM after the capabilities have been
+consumed.
+
+Fixes: 80317ff6adfd ("net/bnxt/tf_core: support Thor2")
+
+Signed-off-by: Manish Kurup <manish.kurup@broadcom.com>
+Reviewed-by: Ajit Khaparde <ajit.khaparde@broadcom.com>
+---
+ drivers/net/bnxt/bnxt_hwrm.c | 21 ++++++++++++---------
+ 1 file changed, 12 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/net/bnxt/bnxt_hwrm.c b/drivers/net/bnxt/bnxt_hwrm.c
+index 4d693da1d5c..0cef22b5ec4 100644
+--- a/drivers/net/bnxt/bnxt_hwrm.c
++++ b/drivers/net/bnxt/bnxt_hwrm.c
+@@ -1198,15 +1198,6 @@ static int __bnxt_hwrm_func_qcaps(struct bnxt *bp)
+ 	if (BNXT_PF(bp))
+ 		bp->pf->total_vnics = rte_le_to_cpu_16(resp->max_vnics);
+ 
+-	if (flags & HWRM_FUNC_QCAPS_OUTPUT_FLAGS_PTP_SUPPORTED) {
+-		if (BNXT_CHIP_P5(bp) || BNXT_PF(bp)) {
+-			bp->flags |= BNXT_FLAG_PTP_SUPPORTED;
+-			PMD_DRV_LOG_LINE(DEBUG, "PTP SUPPORTED");
+-			HWRM_UNLOCK();
+-			bnxt_hwrm_ptp_qcfg(bp);
+-		}
+-	}
+-
+ 	if (flags & HWRM_FUNC_QCAPS_OUTPUT_FLAGS_EXT_STATS_SUPPORTED)
+ 		bp->flags |= BNXT_FLAG_EXT_STATS_SUPPORTED;
+ 
+@@ -1263,6 +1254,18 @@ static int __bnxt_hwrm_func_qcaps(struct bnxt *bp)
+ 	if (flags_ext3 & HWRM_FUNC_QCAPS_OUTPUT_FLAGS_EXT3_RX_RATE_PROFILE_SEL_SUPPORTED)
+ 		bp->fw_cap |= BNXT_FW_CAP_RX_RATE_PROFILE;
+ 
++	/* This block should be kept at the end of this function because it
++	 * sends another hwrm msg.
++	 */
++	if (flags & HWRM_FUNC_QCAPS_OUTPUT_FLAGS_PTP_SUPPORTED) {
++		if (BNXT_CHIP_P5(bp) || BNXT_PF(bp)) {
++			bp->flags |= BNXT_FLAG_PTP_SUPPORTED;
++			PMD_DRV_LOG_LINE(DEBUG, "PTP SUPPORTED");
++			HWRM_UNLOCK();
++			bnxt_hwrm_ptp_qcfg(bp);
++		}
++	}
++
+ unlock:
+ 	HWRM_UNLOCK();
+ 

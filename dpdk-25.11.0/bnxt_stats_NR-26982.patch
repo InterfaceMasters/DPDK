@@ -1,0 +1,97 @@
+diff --git a/drivers/net/bnxt/bnxt_stats.c b/drivers/net/bnxt/bnxt_stats.c
+index 3ed1dc8101..d7946c9854 100644
+--- a/drivers/net/bnxt/bnxt_stats.c
++++ b/drivers/net/bnxt/bnxt_stats.c
+@@ -656,8 +656,7 @@ static int bnxt_stats_get_ext(struct rte_eth_dev *eth_dev,
+ 	struct bnxt *bp = eth_dev->data->dev_private;
+ 	unsigned int num_q_stats;
+ 
+-	num_q_stats = RTE_MIN(bp->rx_cp_nr_rings,
+-			      (unsigned int)RTE_ETHDEV_QUEUE_STAT_CNTRS);
++	num_q_stats = bp->rx_cp_nr_rings;
+ 
+ 	for (i = 0; i < num_q_stats; i++) {
+ 		struct bnxt_rx_queue *rxq = bp->rx_queues[i];
+@@ -675,14 +674,19 @@ static int bnxt_stats_get_ext(struct rte_eth_dev *eth_dev,
+ 		if (unlikely(rc))
+ 			return rc;
+ 
+-		bnxt_fill_rte_eth_stats_ext(bnxt_stats, &ring_stats, qstats, i, true);
++		/*PMD_DRV_LOG_LINE(ERR, "%p: Get stats for rq%u", eth_dev, i);*/
++		if (i < RTE_ETHDEV_QUEUE_STAT_CNTRS) {
++			bnxt_fill_rte_eth_stats_ext(bnxt_stats, &ring_stats, qstats, i, true);
++		} else {
++			bnxt_fill_rte_eth_stats_ext(bnxt_stats, &ring_stats, NULL, i, true);
++		}
++
+ 		bnxt_stats->rx_nombuf +=
+ 				rte_atomic_load_explicit(&rxq->rx_mbuf_alloc_fail,
+ 							 rte_memory_order_relaxed);
+ 	}
+ 
+-	num_q_stats = RTE_MIN(bp->tx_cp_nr_rings,
+-			      (unsigned int)RTE_ETHDEV_QUEUE_STAT_CNTRS);
++	num_q_stats = bp->tx_cp_nr_rings;
+ 
+ 	for (i = 0; i < num_q_stats; i++) {
+ 		struct bnxt_tx_queue *txq = bp->tx_queues[i];
+@@ -697,7 +701,12 @@ static int bnxt_stats_get_ext(struct rte_eth_dev *eth_dev,
+ 		if (unlikely(rc))
+ 			return rc;
+ 
+-		bnxt_fill_rte_eth_stats_ext(bnxt_stats, &ring_stats, qstats, i, false);
++		/*PMD_DRV_LOG_LINE(ERR, "%p: Get stats for tq%u", eth_dev, i);*/
++		if (i < RTE_ETHDEV_QUEUE_STAT_CNTRS) {
++			bnxt_fill_rte_eth_stats_ext(bnxt_stats, &ring_stats, qstats, i, false);
++		} else {
++			bnxt_fill_rte_eth_stats_ext(bnxt_stats, &ring_stats, NULL, i, false);
++		}
+ 	}
+ 
+ 	return rc;
+@@ -721,8 +730,7 @@ int bnxt_stats_get_op(struct rte_eth_dev *eth_dev,
+ 	if (BNXT_TPA_V2_P7(bp))
+ 		return bnxt_stats_get_ext(eth_dev, bnxt_stats, qstats);
+ 
+-	num_q_stats = RTE_MIN(bp->rx_cp_nr_rings,
+-			      (unsigned int)RTE_ETHDEV_QUEUE_STAT_CNTRS);
++	num_q_stats = bp->rx_cp_nr_rings;
+ 
+ 	for (i = 0; i < num_q_stats; i++) {
+ 		struct bnxt_rx_queue *rxq = bp->rx_queues[i];
+@@ -739,14 +747,18 @@ int bnxt_stats_get_op(struct rte_eth_dev *eth_dev,
+ 		if (unlikely(rc))
+ 			return rc;
+ 
+-		bnxt_fill_rte_eth_stats(bnxt_stats, &ring_stats, qstats, i, true);
++		/*PMD_DRV_LOG_LINE(ERR, "%p: Get stats for rq%u", eth_dev, i);*/
++		if (i < RTE_ETHDEV_QUEUE_STAT_CNTRS) {
++			bnxt_fill_rte_eth_stats(bnxt_stats, &ring_stats, qstats, i, true);
++		} else {
++			bnxt_fill_rte_eth_stats(bnxt_stats, &ring_stats, NULL, i, true);
++		}
+ 		bnxt_stats->rx_nombuf +=
+ 				rte_atomic_load_explicit(&rxq->rx_mbuf_alloc_fail,
+ 							 rte_memory_order_relaxed);
+ 	}
+ 
+-	num_q_stats = RTE_MIN(bp->tx_cp_nr_rings,
+-			      (unsigned int)RTE_ETHDEV_QUEUE_STAT_CNTRS);
++	num_q_stats = bp->tx_cp_nr_rings;
+ 
+ 	for (i = 0; i < num_q_stats; i++) {
+ 		struct bnxt_tx_queue *txq = bp->tx_queues[i];
+@@ -761,7 +773,12 @@ int bnxt_stats_get_op(struct rte_eth_dev *eth_dev,
+ 		if (unlikely(rc))
+ 			return rc;
+ 
+-		bnxt_fill_rte_eth_stats(bnxt_stats, &ring_stats, qstats, i, false);
++		/*PMD_DRV_LOG_LINE(ERR, "%p: Get stats for tq%u", eth_dev, i);*/
++		if (i < RTE_ETHDEV_QUEUE_STAT_CNTRS) {
++			bnxt_fill_rte_eth_stats(bnxt_stats, &ring_stats, qstats, i, false);
++		} else {
++			bnxt_fill_rte_eth_stats(bnxt_stats, &ring_stats, NULL, i, false);
++		}
+ 		bnxt_stats->oerrors +=
+ 				rte_atomic_load_explicit(&txq->tx_mbuf_drop,
+ 							 rte_memory_order_relaxed);
