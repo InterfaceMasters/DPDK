@@ -1,0 +1,661 @@
+From 4bcaf7af462f33416f8c3de3e81b0f48dcf9cb2d Mon Sep 17 00:00:00 2001
+From: Keegan Freyhof <keegan.freyhof@broadcom.com>
+Date: Thu, 25 Jun 2026 19:09:27 +0000
+Subject: [PATCH] net/bnxt: Change to stats reporting
+
+When polling for stats at a high frequency using
+STAT_CTX_QUERY and with substantial traffic, the
+HWRM will occasionally include a flipped bit.
+This behavior is observed with both heavy RX and
+TX traffic.
+
+Fixed this by integrating the masks as reported
+by hardware and by adding a filter for hardware
+responses that are powers of 2.
+
+RelnoteHeadline: Change to stats reporting
+
+RelnoteDescChg: Integrated masks as reported
+by hardware and added a filter for hardware
+responses that are powers of 2.
+
+RelnoteIssueDesc: When polling for stats at a
+high frequency using STAT_CTX_QUERY and with
+substantial traffic, the HWRM will occasionally
+include a flipped bit. This behavior is observed
+with both heavy RX and TX traffic.
+
+RelnoteVisibility: Default
+
+BUG: DCSG-171771
+
+AI Review Summary:
+  Current:  Critical=0, Warning=0, Suggestion=3, Info=0
+  Overall:  Critical=0, Warning=0, Suggestion=3, Info=0
+  Ignore:  Critical=0, Warning=0, Suggestion=0, Info=0
+
+AI-Review-Author: Cursor IDE (model: claude-4-sonnet, mode: cursor-ide, duration: 168s)
+AI-Review-ID: 4268512b82-20260624-224457
+Change-Id: Ib53a98516a84312fa7ecb69970239dd62d2a1dbe
+Signed-off-by: Keegan Freyhof <keegan.freyhof@broadcom.com>
+---
+ drivers/net/bnxt/bnxt_cpr.h    |   9 +
+ drivers/net/bnxt/bnxt_ethdev.c |  25 +++
+ drivers/net/bnxt/bnxt_hwrm.c   | 294 +++++++++++++--------------------
+ drivers/net/bnxt/bnxt_hwrm.h   |   8 +-
+ drivers/net/bnxt/bnxt_stats.c  |  81 +++++++--
+ drivers/net/bnxt/bnxt_stats.h  |   7 +
+ 6 files changed, 228 insertions(+), 196 deletions(-)
+
+diff --git a/drivers/net/bnxt/bnxt_cpr.h b/drivers/net/bnxt/bnxt_cpr.h
+index de157ec4ab..e36ebe2f5c 100644
+--- a/drivers/net/bnxt/bnxt_cpr.h
++++ b/drivers/net/bnxt/bnxt_cpr.h
+@@ -96,6 +96,13 @@ struct nqe_cn {
+ 	rte_le32_t      cq_handle_high;
+ };
+ 
++/*
++ * Number of uint64_t counters in struct bnxt_ring_stats and
++ * struct bnxt_ring_stats_ext (defined in bnxt.h).
++ */
++#define BNXT_RING_STATS_CNT		20ULL
++#define BNXT_RING_STATS_EXT_CNT		22ULL
++
+ struct bnxt_ring;
+ struct bnxt_cp_ring_info {
+ 	uint32_t		cp_raw_cons;
+@@ -108,6 +115,8 @@ struct bnxt_cp_ring_info {
+ 	uint16_t		hw_ring_stats_size;
+ 	rte_iova_t		hw_stats_map;
+ 	uint32_t		hw_stats_ctx_id;
++	uint64_t		ring_stats_mask[BNXT_RING_STATS_CNT];
++	uint64_t		ring_stats_ext_mask[BNXT_RING_STATS_EXT_CNT];
+ 
+ 	struct bnxt_ring	*cp_ring_struct;
+ 	bool			valid;
+diff --git a/drivers/net/bnxt/bnxt_ethdev.c b/drivers/net/bnxt/bnxt_ethdev.c
+index a2429561b9..f70d731f1d 100644
+--- a/drivers/net/bnxt/bnxt_ethdev.c
++++ b/drivers/net/bnxt/bnxt_ethdev.c
+@@ -1733,6 +1733,8 @@ static int bnxt_dev_stop(struct rte_eth_dev *eth_dev)
+ 
+ 	eth_dev->data->dev_started = 0;
+ 
++	bnxt_clear_ring_stats_masks(bp);
++
+ 	/* Prevent crashes when queues are still in use */
+ 	bnxt_stop_rxtx(eth_dev);
+ 
+@@ -1881,6 +1883,29 @@ int bnxt_dev_start_op(struct rte_eth_dev *eth_dev)
+ 	if (rc)
+ 		goto error;
+ 
++	bnxt_clear_ring_stats_masks(bp);
++	for (queue_idx = 0; bp->rx_queues && queue_idx < bp->rx_cp_nr_rings; queue_idx++) {
++		struct bnxt_rx_queue *rxq = bp->rx_queues[queue_idx];
++
++		if (rxq == NULL || rxq->cp_ring == NULL)
++			continue;
++		if (BNXT_TPA_V2_P7(bp))
++			bnxt_hwrm_ring_stats_ext_masks(bp, rxq->cp_ring);
++		else
++			bnxt_hwrm_ring_stats_masks(bp, rxq->cp_ring);
++	}
++
++	for (queue_idx = 0; bp->tx_queues && queue_idx < bp->tx_cp_nr_rings; queue_idx++) {
++		struct bnxt_tx_queue *txq = bp->tx_queues[queue_idx];
++
++		if (txq == NULL || txq->cp_ring == NULL)
++			continue;
++		if (BNXT_TPA_V2_P7(bp))
++			bnxt_hwrm_ring_stats_ext_masks(bp, txq->cp_ring);
++		else
++			bnxt_hwrm_ring_stats_masks(bp, txq->cp_ring);
++	}
++
+ 	eth_dev->data->dev_started = 1;
+ 
+ 	bnxt_link_update_op(eth_dev, 0);
+diff --git a/drivers/net/bnxt/bnxt_hwrm.c b/drivers/net/bnxt/bnxt_hwrm.c
+index 4a5b83d29c..c1332f796b 100644
+--- a/drivers/net/bnxt/bnxt_hwrm.c
++++ b/drivers/net/bnxt/bnxt_hwrm.c
+@@ -19,6 +19,7 @@
+ #include "bnxt_rxq.h"
+ #include "bnxt_rxr.h"
+ #include "bnxt_ring.h"
++#include "bnxt_stats.h"
+ #include "bnxt_txq.h"
+ #include "bnxt_txr.h"
+ #include "bnxt_vnic.h"
+@@ -5382,18 +5383,92 @@ int bnxt_hwrm_fwd_resp(struct bnxt *bp, uint16_t target_id,
+ 	return rc;
+ }
+ 
+-static void bnxt_update_prev_stat(uint64_t *cntr, uint64_t *prev_cntr)
++static void bnxt_accumulate_ctr(uint64_t hw, uint64_t *sw, uint64_t mask)
+ {
++	uint64_t sw_tmp, prev, delta;
++
+ 	/* One of the HW stat values that make up this counter was zero as
+ 	 * returned by HW in this iteration, so use the previous
+ 	 * iteration's counter value
+ 	 */
+-	if (!cntr || !prev_cntr)
++	if (!hw)
+ 		return;
+-	if (*prev_cntr && *cntr == 0)
+-		*cntr = *prev_cntr;
+-	else
+-		*prev_cntr = *cntr;
++
++	if (mask == 0 || mask == UINT64_MAX) {
++		*sw = hw;
++		return;
++	}
++	prev = *sw & mask;
++	hw &= mask;
++	/*
++	 * Check if the absolute hw value is a single bit (power of 2)
++	 * and that we are able to end on a power of 2 for precise traffic
++	 * flows.
++	 */
++	if ((hw & (hw - 1)) == 0 && hw > (1ULL << 14)) {
++		delta = (hw - prev) & mask;
++		if (delta > (1ULL << 14))
++			return;
++	}
++	sw_tmp = (*sw & ~mask) | hw;
++	/* Under high frequency stats polling, the driver can sometimes report
++	 * stats that are too high then report the correct stats. Print a debug
++	 * message if this is the case and otherwise assume that it is a
++	 * rollover.
++	 */
++	if (hw < prev) {
++		if ((prev - hw) > (mask >> 1)) {
++			sw_tmp += mask + 1;
++		} else {
++			PMD_DRV_LOG_LINE(DEBUG,
++					 "stat backward step suppressed: "
++					 "prev=%llu hw=%llu drop=%llu mask=%llu",
++					 (unsigned long long)prev,
++					 (unsigned long long)hw,
++					 (unsigned long long)(prev - hw),
++					 (unsigned long long)mask);
++			return;
++		}
++	}
++	*sw = sw_tmp;
++}
++
++int bnxt_hwrm_ring_stats_masks(struct bnxt *bp,
++				      struct bnxt_cp_ring_info *cpr)
++{
++	struct hwrm_stat_ctx_query_input req = {.req_type = 0};
++	struct hwrm_stat_ctx_query_output *resp = bp->hwrm_cmd_resp_addr;
++	uint64_t def = bnxt_default_stat_mask(bp);
++	int rc;
++
++	HWRM_PREP(&req, HWRM_STAT_CTX_QUERY, BNXT_USE_CHIMP_MB);
++	req.stat_ctx_id = rte_cpu_to_le_32(cpr->hw_stats_ctx_id);
++	req.flags = HWRM_STAT_CTX_QUERY_INPUT_FLAGS_COUNTER_MASK;
++	rc = bnxt_hwrm_send_message(bp, &req, sizeof(req), BNXT_USE_CHIMP_MB);
++	bnxt_fill_stat_masks(cpr->ring_stats_mask, BNXT_RING_STATS_CNT,
++			     &resp->tx_ucast_pkts, def,
++			     rc == 0 && resp->error_code == 0);
++	HWRM_UNLOCK();
++	return 0;
++}
++
++int bnxt_hwrm_ring_stats_ext_masks(struct bnxt *bp,
++					  struct bnxt_cp_ring_info *cpr)
++{
++	struct hwrm_stat_ext_ctx_query_input req = {.req_type = 0};
++	struct hwrm_stat_ext_ctx_query_output *resp = bp->hwrm_cmd_resp_addr;
++	uint64_t def = bnxt_default_stat_mask(bp);
++	int rc;
++
++	HWRM_PREP(&req, HWRM_STAT_EXT_CTX_QUERY, BNXT_USE_CHIMP_MB);
++	req.stat_ctx_id = rte_cpu_to_le_32(cpr->hw_stats_ctx_id);
++	req.flags = HWRM_STAT_EXT_CTX_QUERY_INPUT_FLAGS_COUNTER_MASK;
++	rc = bnxt_hwrm_send_message(bp, &req, sizeof(req), BNXT_USE_CHIMP_MB);
++	bnxt_fill_stat_masks(cpr->ring_stats_ext_mask, BNXT_RING_STATS_EXT_CNT,
++			     &resp->rx_ucast_pkts, def,
++			     rc == 0 && resp->error_code == 0);
++	HWRM_UNLOCK();
++	return 0;
+ }
+ 
+ static void bnxt_get_prev_tx_stats(struct bnxt_ring_stats *ring_stats,
+@@ -5425,13 +5500,15 @@ static void bnxt_get_prev_rx_stats(struct bnxt_ring_stats *ring_stats,
+ 	ring_stats->rx_agg_aborts = prev_stats->rx_agg_aborts;
+ }
+ 
+-int bnxt_hwrm_ring_stats(struct bnxt *bp, uint32_t cid, int idx,
++
++int bnxt_hwrm_ring_stats(struct bnxt *bp, struct bnxt_cp_ring_info *cpr, int idx,
+ 			 struct bnxt_ring_stats *ring_stats, bool rx)
+ {
+-	int rc = 0;
++	struct bnxt_ring_stats *prev_stats = &bp->prev_rx_ring_stats[idx];
+ 	struct hwrm_stat_ctx_query_input req = {.req_type = 0};
+ 	struct hwrm_stat_ctx_query_output *resp = bp->hwrm_cmd_resp_addr;
+-	struct bnxt_ring_stats *prev_stats = &bp->prev_rx_ring_stats[idx];
++	uint64_t *prev_stats_u64, *hw_stats, *masks, *ring_stats_u64, i;
++	int rc;
+ 
+ 	if (!rx)
+ 		prev_stats = &bp->prev_tx_ring_stats[idx];
+@@ -5446,88 +5523,24 @@ int bnxt_hwrm_ring_stats(struct bnxt *bp, uint32_t cid, int idx,
+ 	}
+ 	HWRM_PREP(&req, HWRM_STAT_CTX_QUERY, BNXT_USE_CHIMP_MB);
+ 
+-	req.stat_ctx_id = rte_cpu_to_le_32(cid);
++	req.stat_ctx_id = rte_cpu_to_le_32(cpr->hw_stats_ctx_id);
+ 
+ 	rc = bnxt_hwrm_send_message(bp, &req, sizeof(req), BNXT_USE_CHIMP_MB);
+ 
+ 	HWRM_CHECK_RESULT();
+ 
+-	if (rx) {
+-		ring_stats->rx_ucast_pkts = rte_le_to_cpu_64(resp->rx_ucast_pkts);
+-		bnxt_update_prev_stat(&ring_stats->rx_ucast_pkts,
+-				      &prev_stats->rx_ucast_pkts);
+-
+-		ring_stats->rx_mcast_pkts = rte_le_to_cpu_64(resp->rx_mcast_pkts);
+-		bnxt_update_prev_stat(&ring_stats->rx_mcast_pkts,
+-				      &prev_stats->rx_mcast_pkts);
+-
+-		ring_stats->rx_bcast_pkts = rte_le_to_cpu_64(resp->rx_bcast_pkts);
+-		bnxt_update_prev_stat(&ring_stats->rx_bcast_pkts,
+-				      &prev_stats->rx_bcast_pkts);
++	masks = cpr->ring_stats_mask;
++	prev_stats_u64 = (uint64_t *)prev_stats;
++	hw_stats = (uint64_t *)&resp->tx_ucast_pkts;
++	ring_stats_u64 = (uint64_t *)ring_stats;
+ 
+-		ring_stats->rx_ucast_bytes = rte_le_to_cpu_64(resp->rx_ucast_bytes);
+-		bnxt_update_prev_stat(&ring_stats->rx_ucast_bytes,
+-				      &prev_stats->rx_ucast_bytes);
+-
+-		ring_stats->rx_mcast_bytes = rte_le_to_cpu_64(resp->rx_mcast_bytes);
+-		bnxt_update_prev_stat(&ring_stats->rx_mcast_bytes,
+-				      &prev_stats->rx_mcast_bytes);
+-
+-		ring_stats->rx_bcast_bytes = rte_le_to_cpu_64(resp->rx_bcast_bytes);
+-		bnxt_update_prev_stat(&ring_stats->rx_bcast_bytes,
+-				      &prev_stats->rx_bcast_bytes);
+-
+-		ring_stats->rx_discard_pkts = rte_le_to_cpu_64(resp->rx_discard_pkts);
+-		bnxt_update_prev_stat(&ring_stats->rx_discard_pkts,
+-				      &prev_stats->rx_discard_pkts);
+-
+-		ring_stats->rx_error_pkts = rte_le_to_cpu_64(resp->rx_error_pkts);
+-		bnxt_update_prev_stat(&ring_stats->rx_error_pkts,
+-				      &prev_stats->rx_error_pkts);
+-
+-		ring_stats->rx_agg_pkts = rte_le_to_cpu_64(resp->rx_agg_pkts);
+-		bnxt_update_prev_stat(&ring_stats->rx_agg_pkts,
+-				      &prev_stats->rx_agg_pkts);
+-
+-		ring_stats->rx_agg_bytes = rte_le_to_cpu_64(resp->rx_agg_bytes);
+-		bnxt_update_prev_stat(&ring_stats->rx_agg_bytes,
+-				      &prev_stats->rx_agg_bytes);
+-
+-		ring_stats->rx_agg_events = rte_le_to_cpu_64(resp->rx_agg_events);
+-		bnxt_update_prev_stat(&ring_stats->rx_agg_events,
+-				      &prev_stats->rx_agg_events);
+-
+-		ring_stats->rx_agg_aborts = rte_le_to_cpu_64(resp->rx_agg_aborts);
+-		bnxt_update_prev_stat(&ring_stats->rx_agg_aborts,
+-				      &prev_stats->rx_agg_aborts);
+-	} else {
+-		ring_stats->tx_ucast_pkts = rte_le_to_cpu_64(resp->tx_ucast_pkts);
+-		bnxt_update_prev_stat(&ring_stats->tx_ucast_pkts,
+-				      &prev_stats->tx_ucast_pkts);
+-
+-		ring_stats->tx_mcast_pkts = rte_le_to_cpu_64(resp->tx_mcast_pkts);
+-		bnxt_update_prev_stat(&ring_stats->tx_mcast_pkts,
+-				      &prev_stats->tx_mcast_pkts);
+-
+-		ring_stats->tx_bcast_pkts = rte_le_to_cpu_64(resp->tx_bcast_pkts);
+-		bnxt_update_prev_stat(&ring_stats->tx_bcast_pkts,
+-				      &prev_stats->tx_bcast_pkts);
+-
+-		ring_stats->tx_ucast_bytes = rte_le_to_cpu_64(resp->tx_ucast_bytes);
+-		bnxt_update_prev_stat(&ring_stats->tx_ucast_bytes,
+-				      &prev_stats->tx_ucast_bytes);
+-
+-		ring_stats->tx_mcast_bytes = rte_le_to_cpu_64(resp->tx_mcast_bytes);
+-		bnxt_update_prev_stat(&ring_stats->tx_mcast_bytes,
+-				      &prev_stats->tx_mcast_bytes);
+-
+-		ring_stats->tx_bcast_bytes = rte_le_to_cpu_64(resp->tx_bcast_bytes);
+-		bnxt_update_prev_stat(&ring_stats->tx_bcast_bytes,
+-				      &prev_stats->tx_bcast_bytes);
+-
+-		ring_stats->tx_discard_pkts = rte_le_to_cpu_64(resp->tx_discard_pkts);
+-		bnxt_update_prev_stat(&ring_stats->tx_discard_pkts,
+-				      &prev_stats->tx_discard_pkts);
++	/* RX stats are >= 8 and TX are < 8 */
++	for (i = (rx) ? 8 : 0; i < BNXT_RING_STATS_CNT; i++) {
++		if (!rx && i >= 8)
++			continue;
++		bnxt_accumulate_ctr(rte_le_to_cpu_64(hw_stats[i]), &prev_stats_u64[i],
++				    masks[i]);
++		ring_stats_u64[i] = prev_stats_u64[i];
+ 	}
+ 
+ 	HWRM_UNLOCK();
+@@ -5567,14 +5580,15 @@ static void bnxt_get_prev_tx_stats_ext(struct bnxt_ring_stats_ext *ring_stats,
+ 	ring_stats->tx_error_pkts = prev_stats->tx_error_pkts;
+ }
+ 
+-int bnxt_hwrm_ring_stats_ext(struct bnxt *bp, uint32_t cid, int idx,
+-			     struct bnxt_ring_stats_ext *ring_stats, bool rx)
++int bnxt_hwrm_ring_stats_ext(struct bnxt *bp, struct bnxt_cp_ring_info *cpr,
++			    int idx, struct bnxt_ring_stats_ext *ring_stats,
++			    bool rx)
+ {
+-	int rc = 0;
++	struct bnxt_ring_stats_ext *prev_stats = &bp->prev_rx_ring_stats_ext[idx];
+ 	struct hwrm_stat_ext_ctx_query_input req = {.req_type = 0};
+ 	struct hwrm_stat_ext_ctx_query_output *resp = bp->hwrm_cmd_resp_addr;
+-
+-	struct bnxt_ring_stats_ext *prev_stats = &bp->prev_rx_ring_stats_ext[idx];
++	uint64_t *prev_stats_u64, *hw_stats, *masks, *ring_stats_u64, i;
++	int rc;
+ 
+ 	if (!rx)
+ 		prev_stats = &bp->prev_tx_ring_stats_ext[idx];
+@@ -5589,99 +5603,23 @@ int bnxt_hwrm_ring_stats_ext(struct bnxt *bp, uint32_t cid, int idx,
+ 	}
+ 	HWRM_PREP(&req, HWRM_STAT_EXT_CTX_QUERY, BNXT_USE_CHIMP_MB);
+ 
+-	req.stat_ctx_id = rte_cpu_to_le_32(cid);
++	req.stat_ctx_id = rte_cpu_to_le_32(cpr->hw_stats_ctx_id);
+ 	rc = bnxt_hwrm_send_message(bp, &req, sizeof(req), BNXT_USE_CHIMP_MB);
+ 
+ 	HWRM_CHECK_RESULT();
+ 
+-	if (rx) {
+-		ring_stats->rx_ucast_pkts = rte_le_to_cpu_64(resp->rx_ucast_pkts);
+-		bnxt_update_prev_stat(&ring_stats->rx_ucast_pkts,
+-				      &prev_stats->rx_ucast_pkts);
++	masks = cpr->ring_stats_ext_mask;
++	prev_stats_u64 = (uint64_t *)prev_stats;
++	hw_stats = (uint64_t *)&resp->rx_ucast_pkts;
++	ring_stats_u64 = (uint64_t *)ring_stats;
+ 
+-		ring_stats->rx_mcast_pkts = rte_le_to_cpu_64(resp->rx_mcast_pkts);
+-		bnxt_update_prev_stat(&ring_stats->rx_mcast_pkts,
+-				      &prev_stats->rx_mcast_pkts);
+-
+-		ring_stats->rx_bcast_pkts = rte_le_to_cpu_64(resp->rx_bcast_pkts);
+-		bnxt_update_prev_stat(&ring_stats->rx_bcast_pkts,
+-				      &prev_stats->rx_bcast_pkts);
+-
+-		ring_stats->rx_ucast_bytes = rte_le_to_cpu_64(resp->rx_ucast_bytes);
+-		bnxt_update_prev_stat(&ring_stats->rx_ucast_bytes,
+-				      &prev_stats->rx_ucast_bytes);
+-
+-		ring_stats->rx_mcast_bytes = rte_le_to_cpu_64(resp->rx_mcast_bytes);
+-		bnxt_update_prev_stat(&ring_stats->rx_mcast_bytes,
+-				      &prev_stats->rx_mcast_bytes);
+-
+-		ring_stats->rx_bcast_bytes = rte_le_to_cpu_64(resp->rx_bcast_bytes);
+-		bnxt_update_prev_stat(&ring_stats->rx_bcast_bytes,
+-				      &prev_stats->rx_bcast_bytes);
+-
+-		ring_stats->rx_discard_pkts = rte_le_to_cpu_64(resp->rx_discard_pkts);
+-		bnxt_update_prev_stat(&ring_stats->rx_discard_pkts,
+-				      &prev_stats->rx_discard_pkts);
+-
+-		ring_stats->rx_error_pkts = rte_le_to_cpu_64(resp->rx_error_pkts);
+-		bnxt_update_prev_stat(&ring_stats->rx_error_pkts,
+-				      &prev_stats->rx_error_pkts);
+-
+-		ring_stats->rx_tpa_eligible_pkt = rte_le_to_cpu_64(resp->rx_tpa_eligible_pkt);
+-		bnxt_update_prev_stat(&ring_stats->rx_tpa_eligible_pkt,
+-				      &prev_stats->rx_tpa_eligible_pkt);
+-
+-		ring_stats->rx_tpa_eligible_bytes = rte_le_to_cpu_64(resp->rx_tpa_eligible_bytes);
+-		bnxt_update_prev_stat(&ring_stats->rx_tpa_eligible_bytes,
+-				      &prev_stats->rx_tpa_eligible_bytes);
+-
+-		ring_stats->rx_tpa_pkt = rte_le_to_cpu_64(resp->rx_tpa_pkt);
+-		bnxt_update_prev_stat(&ring_stats->rx_tpa_pkt,
+-				      &prev_stats->rx_tpa_pkt);
+-
+-		ring_stats->rx_tpa_bytes = rte_le_to_cpu_64(resp->rx_tpa_bytes);
+-		bnxt_update_prev_stat(&ring_stats->rx_tpa_bytes,
+-				      &prev_stats->rx_tpa_bytes);
+-
+-		ring_stats->rx_tpa_errors = rte_le_to_cpu_64(resp->rx_tpa_errors);
+-		bnxt_update_prev_stat(&ring_stats->rx_tpa_errors,
+-				      &prev_stats->rx_tpa_errors);
+-
+-		ring_stats->rx_tpa_events = rte_le_to_cpu_64(resp->rx_tpa_events);
+-		bnxt_update_prev_stat(&ring_stats->rx_tpa_events,
+-				      &prev_stats->rx_tpa_events);
+-	} else {
+-		ring_stats->tx_ucast_pkts = rte_le_to_cpu_64(resp->tx_ucast_pkts);
+-		bnxt_update_prev_stat(&ring_stats->tx_ucast_pkts,
+-				      &prev_stats->tx_ucast_pkts);
+-
+-		ring_stats->tx_mcast_pkts = rte_le_to_cpu_64(resp->tx_mcast_pkts);
+-		bnxt_update_prev_stat(&ring_stats->tx_mcast_pkts,
+-				      &prev_stats->tx_mcast_pkts);
+-
+-		ring_stats->tx_bcast_pkts = rte_le_to_cpu_64(resp->tx_bcast_pkts);
+-		bnxt_update_prev_stat(&ring_stats->tx_bcast_pkts,
+-				      &prev_stats->tx_bcast_pkts);
+-
+-		ring_stats->tx_ucast_bytes = rte_le_to_cpu_64(resp->tx_ucast_bytes);
+-		bnxt_update_prev_stat(&ring_stats->tx_ucast_bytes,
+-				      &prev_stats->tx_ucast_bytes);
+-
+-		ring_stats->tx_mcast_bytes = rte_le_to_cpu_64(resp->tx_mcast_bytes);
+-		bnxt_update_prev_stat(&ring_stats->tx_mcast_bytes,
+-				      &prev_stats->tx_mcast_bytes);
+-
+-		ring_stats->tx_bcast_bytes = rte_le_to_cpu_64(resp->tx_bcast_bytes);
+-		bnxt_update_prev_stat(&ring_stats->tx_bcast_bytes,
+-				      &prev_stats->tx_bcast_bytes);
+-
+-		ring_stats->tx_discard_pkts = rte_le_to_cpu_64(resp->tx_discard_pkts);
+-		bnxt_update_prev_stat(&ring_stats->tx_discard_pkts,
+-				      &prev_stats->tx_discard_pkts);
+-
+-		ring_stats->tx_error_pkts = rte_le_to_cpu_64(resp->tx_error_pkts);
+-		bnxt_update_prev_stat(&ring_stats->tx_error_pkts,
+-				      &prev_stats->tx_error_pkts);
++	/* RX stats are < 8 and >= 16 and TX are >= 8 and < 16*/
++	for (i = (rx) ? 0 : 8; i < BNXT_RING_STATS_EXT_CNT; i++) {
++		if ((rx && (i >= 8 && i < 16)) || (!rx && i >= 16))
++			continue;
++		bnxt_accumulate_ctr(rte_le_to_cpu_64(hw_stats[i]), &prev_stats_u64[i],
++				    masks[i]);
++		ring_stats_u64[i] = prev_stats_u64[i];
+ 	}
+ 
+ 	HWRM_UNLOCK();
+diff --git a/drivers/net/bnxt/bnxt_hwrm.h b/drivers/net/bnxt/bnxt_hwrm.h
+index fc56223ab4..59ef91254e 100644
+--- a/drivers/net/bnxt/bnxt_hwrm.h
++++ b/drivers/net/bnxt/bnxt_hwrm.h
+@@ -364,10 +364,14 @@ int bnxt_hwrm_fw_echo_reply(struct bnxt *bp, uint32_t echo_req_data1,
+ 			    uint32_t echo_req_data2);
+ int bnxt_hwrm_poll_ver_get(struct bnxt *bp);
+ int bnxt_hwrm_rx_ring_reset(struct bnxt *bp, int queue_index);
+-int bnxt_hwrm_ring_stats(struct bnxt *bp, uint32_t cid, int idx,
++int bnxt_hwrm_ring_stats(struct bnxt *bp, struct bnxt_cp_ring_info *cpr, int idx,
+ 			 struct bnxt_ring_stats *stats, bool rx);
+-int bnxt_hwrm_ring_stats_ext(struct bnxt *bp, uint32_t cid, int idx,
++int bnxt_hwrm_ring_stats_ext(struct bnxt *bp, struct bnxt_cp_ring_info *cpr, int idx,
+ 			     struct bnxt_ring_stats_ext *ring_stats, bool rx);
++int bnxt_hwrm_ring_stats_masks(struct bnxt *bp,
++			       struct bnxt_cp_ring_info *cpr);
++int bnxt_hwrm_ring_stats_ext_masks(struct bnxt *bp,
++				   struct bnxt_cp_ring_info *cpr);
+ int bnxt_hwrm_read_sfp_module_eeprom_info(struct bnxt *bp, uint16_t i2c_addr,
+ 					  uint16_t page_number, uint16_t start_addr,
+ 					  uint16_t data_length, uint8_t *buf);
+diff --git a/drivers/net/bnxt/bnxt_stats.c b/drivers/net/bnxt/bnxt_stats.c
+index ba858710a5..3cc3e02369 100644
+--- a/drivers/net/bnxt/bnxt_stats.c
++++ b/drivers/net/bnxt/bnxt_stats.c
+@@ -675,8 +675,7 @@ static int bnxt_stats_get_ext(struct rte_eth_dev *eth_dev,
+ 		if (cpr->hw_stats_ctx_id == HWRM_NA_SIGNATURE)
+ 			continue;
+ 
+-		rc = bnxt_hwrm_ring_stats_ext(bp, cpr->hw_stats_ctx_id, i,
+-					      &ring_stats, true);
++		rc = bnxt_hwrm_ring_stats_ext(bp, cpr, i, &ring_stats, true);
+ 		if (unlikely(rc))
+ 			return rc;
+ 
+@@ -701,8 +700,7 @@ static int bnxt_stats_get_ext(struct rte_eth_dev *eth_dev,
+ 		if (!txq->tx_started)
+ 			continue;
+ 
+-		rc = bnxt_hwrm_ring_stats_ext(bp, cpr->hw_stats_ctx_id, i,
+-					      &ring_stats, false);
++		rc = bnxt_hwrm_ring_stats_ext(bp, cpr, i, &ring_stats, false);
+ 		if (unlikely(rc))
+ 			return rc;
+ 
+@@ -741,8 +739,7 @@ int bnxt_stats_get_op(struct rte_eth_dev *eth_dev,
+ 		if (cpr->hw_stats_ctx_id == HWRM_NA_SIGNATURE)
+ 			continue;
+ 
+-		rc = bnxt_hwrm_ring_stats(bp, cpr->hw_stats_ctx_id, i,
+-					  &ring_stats, true);
++		rc = bnxt_hwrm_ring_stats(bp, cpr, i, &ring_stats, true);
+ 		if (unlikely(rc))
+ 			return rc;
+ 
+@@ -764,8 +761,7 @@ int bnxt_stats_get_op(struct rte_eth_dev *eth_dev,
+ 		if (!txq->tx_started)
+ 			continue;
+ 
+-		rc = bnxt_hwrm_ring_stats(bp, cpr->hw_stats_ctx_id, i,
+-					  &ring_stats, false);
++		rc = bnxt_hwrm_ring_stats(bp, cpr, i, &ring_stats, false);
+ 		if (unlikely(rc))
+ 			return rc;
+ 
+@@ -779,6 +775,60 @@ int bnxt_stats_get_op(struct rte_eth_dev *eth_dev,
+ 	return rc;
+ }
+ 
++uint64_t bnxt_default_stat_mask(struct bnxt *bp)
++{
++	if (BNXT_CHIP_P5(bp) || BNXT_CHIP_P7(bp))
++		return (1ULL << 48) - 1;
++
++	return UINT64_MAX;
++}
++
++void bnxt_fill_stat_masks(uint64_t *masks, unsigned int cnt,
++			  const uint64_t *first, uint64_t def, bool query_ok)
++{
++	unsigned int i;
++
++	for (i = 0; i < cnt; i++)
++		masks[i] = query_ok ? rte_le_to_cpu_64(first[i]) : def;
++}
++
++void bnxt_clear_ring_stats_masks(struct bnxt *bp)
++{
++	uint64_t def = bnxt_default_stat_mask(bp);
++	uint16_t queue_idx;
++
++	for (queue_idx = 0; bp->rx_queues && queue_idx < bp->rx_cp_nr_rings; queue_idx++) {
++		struct bnxt_rx_queue *rxq = bp->rx_queues[queue_idx];
++
++		if (rxq == NULL || rxq->cp_ring == NULL)
++			continue;
++
++		bnxt_fill_stat_masks(rxq->cp_ring->ring_stats_mask,
++				     BNXT_RING_STATS_CNT,
++				     rxq->cp_ring->ring_stats_mask,
++				     def, false);
++		bnxt_fill_stat_masks(rxq->cp_ring->ring_stats_ext_mask,
++				     BNXT_RING_STATS_EXT_CNT,
++				     rxq->cp_ring->ring_stats_ext_mask,
++				     def, false);
++	}
++
++	for (queue_idx = 0; bp->tx_queues && queue_idx < bp->tx_cp_nr_rings; queue_idx++) {
++		struct bnxt_tx_queue *txq = bp->tx_queues[queue_idx];
++
++		if (txq == NULL || txq->cp_ring == NULL)
++			continue;
++		bnxt_fill_stat_masks(txq->cp_ring->ring_stats_mask,
++				     BNXT_RING_STATS_CNT,
++				     txq->cp_ring->ring_stats_mask,
++				     def, false);
++		bnxt_fill_stat_masks(txq->cp_ring->ring_stats_ext_mask,
++				     BNXT_RING_STATS_EXT_CNT,
++				     txq->cp_ring->ring_stats_ext_mask,
++				     def, false);
++	}
++}
++
+ static void bnxt_clear_prev_stat(struct bnxt *bp)
+ {
+ 	/*
+@@ -942,11 +992,10 @@ int bnxt_dev_xstats_get_op(struct rte_eth_dev *eth_dev,
+ 			continue;
+ 
+ 		if (BNXT_TPA_V2_P7(bp))
+-			rc = bnxt_hwrm_ring_stats_ext(bp, cpr->hw_stats_ctx_id, i,
+-						      &ring_stats_ext, true);
++			rc = bnxt_hwrm_ring_stats_ext(bp, cpr, i,
++						     &ring_stats_ext, true);
+ 		else
+-			rc = bnxt_hwrm_ring_stats(bp, cpr->hw_stats_ctx_id, i,
+-						  &ring_stats, true);
++			rc = bnxt_hwrm_ring_stats(bp, cpr, i, &ring_stats, true);
+ 
+ 		if (unlikely(rc))
+ 			return rc;
+@@ -968,11 +1017,11 @@ int bnxt_dev_xstats_get_op(struct rte_eth_dev *eth_dev,
+ 			continue;
+ 
+ 		if (BNXT_TPA_V2_P7(bp))
+-			rc = bnxt_hwrm_ring_stats_ext(bp, cpr->hw_stats_ctx_id, i,
+-						      &ring_stats_ext, false);
++			rc = bnxt_hwrm_ring_stats_ext(bp, cpr, i,
++						     &ring_stats_ext, false);
+ 		else
+-			rc = bnxt_hwrm_ring_stats(bp, cpr->hw_stats_ctx_id, i,
+-						  &ring_stats, false);
++			rc = bnxt_hwrm_ring_stats(bp, cpr, i, &ring_stats, false);
++
+ 		if (unlikely(rc))
+ 			return rc;
+ 
+diff --git a/drivers/net/bnxt/bnxt_stats.h b/drivers/net/bnxt/bnxt_stats.h
+index c0508e773a..cffa2a5f8d 100644
+--- a/drivers/net/bnxt/bnxt_stats.h
++++ b/drivers/net/bnxt/bnxt_stats.h
+@@ -8,6 +8,13 @@
+ 
+ #include <ethdev_driver.h>
+ 
++struct bnxt;
++
++uint64_t bnxt_default_stat_mask(struct bnxt *bp);
++void bnxt_fill_stat_masks(uint64_t *masks, unsigned int cnt,
++			  const uint64_t *first, uint64_t def, bool query_ok);
++void bnxt_clear_ring_stats_masks(struct bnxt *bp);
++
+ void bnxt_free_stats(struct bnxt *bp);
+ int bnxt_stats_get_op(struct rte_eth_dev *eth_dev,
+ 			   struct rte_eth_stats *bnxt_stats, struct eth_queue_stats *qstats);
+-- 
+2.43.0
+

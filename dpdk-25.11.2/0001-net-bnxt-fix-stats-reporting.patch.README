@@ -1,0 +1,43 @@
+https://bugs.dpdk.org/show_bug.cgi?id=1947
+
+===
+
+Oleksandr Nahnybida
+￼
+2:33 PM (3 hours ago)
+￼
+Add reaction
+￼
+Reply
+￼
+More
+to Kishore, me, Taras
+￼
+Hello Kishore,
+
+I tried your patch, and it helped, but only partially, the values are still wrong, just by smaller amounts. The key issue is that the corruption is a single flipped bit whose position varies widely (I observed
+flips anywhere from roughly bit 37 to bit 47), and the flip can go in either direction:
+
+- a 0 -> 1 flip makes the counter too high,
+- a 1 -> 0 flip on a real bit makes it too low.
+
+Because the flipped bit sits within the 48-bit counter width and isn't always a power of two (real traffic is present too), neither the per-counter mask nor the power-of-two filter in your patch catches all
+cases. I also confirmed the mask query returns a flat 48-bit mask for every counter, so masking doesn't help.
+
+But I tried another approach, by sending double STAT_CTX_QUERY requests in a sequence and comparing for irregularities and selecting the better value, which seems to work very well. I see stable stats all the time.
+
+I also see a steady stream of logs where irregularity is detected and corrected:
+  BNXT: bnxt_pick_stat(): BNXT STATS xcheck: r1=0x33a7de000 r2=0x40033a7e1480 prev=0x3392cb000 -> 0x33a7de000
+  BNXT: bnxt_pick_stat(): BNXT STATS xcheck: r1=0xa60fec0 r2=0x10a60ff64 prev=0xa5ca200 -> 0xa60fec0
+  BNXT: bnxt_pick_stat(): BNXT STATS xcheck: r1=0x0 r2=0x4000000000 prev=0x0 -> 0x0
+  BNXT: bnxt_pick_stat(): BNXT STATS xcheck: r1=0xaefd015 r2=0x80aefd0fa prev=0xaeb13ff -> 0xaefd015
+
+Note the third line, the flipped bit on a counter that is idle and reading zero. With no traffic and no accumulation taking place, this points to a single bit error in the counter read/report path rather than
+anything related to traffic or carry propagation, which theoretically should also make it easy to reproduce by polling an idle stat context at high frequency (I haven't tried that).
+
+What do you think about this approach? Patch attached, you should be able to apply it over your patch.
+
+Best regards,
+Oleksandr
+￼
+
