@@ -2,6 +2,24 @@ https://bugs.dpdk.org/show_bug.cgi?id=1947
 
 ===
 
+
+Kishore Padmanabha <kishore.padmanabha@broadcom.com>
+Attachments
+Thu, Jun 25, 11:13 PM (18 hours ago)
+This message has been digitally signed by the sender.
+to me
+
+Hi Vitaliy,
+
+Attached is the patch I would like to try and see if it fixes your issue.
+Let me know how it goes. You should be able to apply it on the latest DPDK
+release.
+
+Thanks,
+Kishore
+
+===
+
 Oleksandr Nahnybida
 ￼
 2:33 PM (3 hours ago)
@@ -41,3 +59,6 @@ Best regards,
 Oleksandr
 ￼
 
+===
+
+New patch is an adaptation to DPDK 25.11.2 from Oleksandr Nahnybida.

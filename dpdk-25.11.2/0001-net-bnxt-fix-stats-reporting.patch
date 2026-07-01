@@ -1,223 +1,299 @@
-From 0420762f7d956551c726f5fc5c5ad99943566f55 Mon Sep 17 00:00:00 2001
-From: Oleksandr Nahnybida <oleksandrn@interfacemasters.com>
-Date: Fri, 26 Jun 2026 17:24:35 +0300
-Subject: [PATCH] net/bnxt: fix stats reporting
-
----
- drivers/net/bnxt/bnxt_hwrm.c | 133 +++++++++++++++++++++++------------
- 1 file changed, 88 insertions(+), 45 deletions(-)
-
 diff --git a/drivers/net/bnxt/bnxt_hwrm.c b/drivers/net/bnxt/bnxt_hwrm.c
-index c1332f796b..d567a51a6e 100644
+index ac5cbbae0c..cdf65f0d45 100644
 --- a/drivers/net/bnxt/bnxt_hwrm.c
 +++ b/drivers/net/bnxt/bnxt_hwrm.c
-@@ -5385,8 +5385,6 @@ int bnxt_hwrm_fwd_resp(struct bnxt *bp, uint16_t target_id,
- 
- static void bnxt_accumulate_ctr(uint64_t hw, uint64_t *sw, uint64_t mask)
- {
--	uint64_t sw_tmp, prev, delta;
--
- 	/* One of the HW stat values that make up this counter was zero as
- 	 * returned by HW in this iteration, so use the previous
- 	 * iteration's counter value
-@@ -5398,39 +5396,59 @@ static void bnxt_accumulate_ctr(uint64_t hw, uint64_t *sw, uint64_t mask)
- 		*sw = hw;
- 		return;
- 	}
--	prev = *sw & mask;
-+	uint64_t prev = *sw & mask;
- 	hw &= mask;
--	/*
--	 * Check if the absolute hw value is a single bit (power of 2)
--	 * and that we are able to end on a power of 2 for precise traffic
--	 * flows.
--	 */
--	if ((hw & (hw - 1)) == 0 && hw > (1ULL << 14)) {
--		delta = (hw - prev) & mask;
--		if (delta > (1ULL << 14))
--			return;
--	}
--	sw_tmp = (*sw & ~mask) | hw;
--	/* Under high frequency stats polling, the driver can sometimes report
--	 * stats that are too high then report the correct stats. Print a debug
--	 * message if this is the case and otherwise assume that it is a
--	 * rollover.
--	 */
-+
-+	/* handle a 48-bit counter rollover. */
- 	if (hw < prev) {
- 		if ((prev - hw) > (mask >> 1)) {
--			sw_tmp += mask + 1;
--		} else {
--			PMD_DRV_LOG_LINE(DEBUG,
--					 "stat backward step suppressed: "
--					 "prev=%llu hw=%llu drop=%llu mask=%llu",
--					 (unsigned long long)prev,
--					 (unsigned long long)hw,
--					 (unsigned long long)(prev - hw),
--					 (unsigned long long)mask);
--			return;
-+			*sw = ((*sw & ~mask) | hw) + mask + 1; /* rollover */
-+		}
-+		/* else: small backward step - keep prev */
-+		return;
-+	}
-+	*sw = (*sw & ~mask) | hw;
-+}
-+
-+static uint64_t bnxt_pick_stat(uint64_t r1, uint64_t r2, uint64_t prev, uint64_t mask)
-+{
-+	uint64_t best = 0;
-+	bool     have = false;
-+
-+	if (mask == 0 || mask == UINT64_MAX) {
-+		return r2;
-+	}
-+
-+	uint64_t a = r1 & mask;
-+	uint64_t b = r2 & mask;
-+	prev &= mask;
-+
-+	/* Reads agree -> no glitch, use the later (larger) read. */
-+	if (a == b)
-+		return b;
-+
-+	/* Among the reads >= prev, take the one closest to prev. */
-+	if (a >= prev) {
-+		best = a;
-+		have = true;
-+	}
-+	if (b >= prev && (!have || (b - prev) < (best - prev))) {
-+		best = b;
-+		have = true;
-+	}
-+	if (have) {
-+		uint64_t v = a > b ? a - b : b - a;
-+		if (v > (1ULL << 28)) {
-+			PMD_DRV_LOG_LINE(NOTICE, "STATS xcheck: r1=0x%" PRIx64 " r2=0x%" PRIx64 " prev=0x%" PRIx64 " -> 0x%" PRIx64, a, b, prev, best);
- 		}
-+		return best;
- 	}
--	*sw = sw_tmp;
-+
-+	/* Both reads below prev: possible 48-bit rollover or both glitched
-+	 * low. Warn and hand the later read to bnxt_accumulate_ctr to resolve.
-+	 */
-+	PMD_DRV_LOG_LINE(NOTICE, "STATS xcheck both<prev: r1=0x%" PRIx64 " r2=0x%" PRIx64 " prev=0x%" PRIx64, a, b, prev);
-+	return b;
+@@ -5342,6 +5342,10 @@ int bnxt_hwrm_fwd_resp(struct bnxt *bp, uint16_t target_id,
+ 	return rc;
  }
  
- int bnxt_hwrm_ring_stats_masks(struct bnxt *bp,
-@@ -5507,7 +5525,8 @@ int bnxt_hwrm_ring_stats(struct bnxt *bp, struct bnxt_cp_ring_info *cpr, int idx
- 	struct bnxt_ring_stats *prev_stats = &bp->prev_rx_ring_stats[idx];
++#define BNXT_RING_STATS_CNT     20ULL
++#define BNXT_RING_STATS_EXT_CNT 22ULL
++#define BNXT_STAT_READS         3
++
+ static void bnxt_update_prev_stat(uint64_t *cntr, uint64_t *prev_cntr)
+ {
+ 	/* One of the HW stat values that make up this counter was zero as
+@@ -5356,6 +5360,33 @@ static void bnxt_update_prev_stat(uint64_t *cntr, uint64_t *prev_cntr)
+ 		*prev_cntr = *cntr;
+ }
+ 
++static uint64_t bnxt_pick_stat(uint64_t a, uint64_t b, uint64_t c, uint64_t prev)
++{
++	uint64_t med  = RTE_MAX(RTE_MIN(a, b), RTE_MIN(RTE_MAX(a, b), c));
++	uint64_t smin = RTE_MIN(RTE_MIN(a, b), c);
++	uint64_t smax = RTE_MAX(RTE_MAX(a, b), c);
++
++	if (smax - smin > (1ULL << 28))
++		PMD_DRV_LOG_LINE(NOTICE,
++			"STATS xcheck: r1=0x%llx r2=0x%llx r3=0x%llx prev=0x%llx -> 0x%llx",
++			(unsigned long long)a, (unsigned long long)b,
++			(unsigned long long)c, (unsigned long long)prev,
++			(unsigned long long)med);
++	return med;
++}
++
++static void bnxt_median_apply(uint64_t *r0, uint64_t *r1, uint64_t *r2,
++			      uint64_t *ring, uint64_t *prev,
++			      uint64_t start, uint64_t end)
++{
++	uint64_t i;
++
++	for (i = start; i < end; i++) {
++		ring[i] = bnxt_pick_stat(r0[i], r1[i], r2[i], prev[i]);
++		bnxt_update_prev_stat(&ring[i], &prev[i]);
++	}
++}
++
+ static void bnxt_get_prev_tx_stats(struct bnxt_ring_stats *ring_stats,
+ 				   struct bnxt_ring_stats *prev_stats)
+ {
+@@ -5392,6 +5423,8 @@ int bnxt_hwrm_ring_stats(struct bnxt *bp, uint32_t cid, int idx,
  	struct hwrm_stat_ctx_query_input req = {.req_type = 0};
  	struct hwrm_stat_ctx_query_output *resp = bp->hwrm_cmd_resp_addr;
--	uint64_t *prev_stats_u64, *hw_stats, *masks, *ring_stats_u64, i;
-+	uint64_t hw1[BNXT_RING_STATS_CNT], hw2[BNXT_RING_STATS_CNT];
-+	uint64_t *prev_stats_u64, *masks, *ring_stats_u64, i;
- 	int rc;
+ 	struct bnxt_ring_stats *prev_stats = &bp->prev_rx_ring_stats[idx];
++	uint64_t hw[BNXT_STAT_READS][BNXT_RING_STATS_CNT];
++	uint64_t *prev_stats_u64, *ring_stats_u64, i, r;
  
  	if (!rx)
-@@ -5521,30 +5540,41 @@ int bnxt_hwrm_ring_stats(struct bnxt *bp, struct bnxt_cp_ring_info *cpr, int idx
+ 		prev_stats = &bp->prev_tx_ring_stats[idx];
+@@ -5404,93 +5437,26 @@ int bnxt_hwrm_ring_stats(struct bnxt *bp, uint32_t cid, int idx,
  
  		return 0;
  	}
 -	HWRM_PREP(&req, HWRM_STAT_CTX_QUERY, BNXT_USE_CHIMP_MB);
- 
-+	/* First read. */
-+	HWRM_PREP(&req, HWRM_STAT_CTX_QUERY, BNXT_USE_CHIMP_MB);
- 	req.stat_ctx_id = rte_cpu_to_le_32(cpr->hw_stats_ctx_id);
 -
- 	rc = bnxt_hwrm_send_message(bp, &req, sizeof(req), BNXT_USE_CHIMP_MB);
-+	HWRM_CHECK_RESULT();
-+	for (i = 0; i < BNXT_RING_STATS_CNT; i++)
-+		hw1[i] = rte_le_to_cpu_64(((uint64_t *)&resp->tx_ucast_pkts)[i]);
-+	HWRM_UNLOCK();
+-	req.stat_ctx_id = rte_cpu_to_le_32(cid);
+-
+-	rc = bnxt_hwrm_send_message(bp, &req, sizeof(req), BNXT_USE_CHIMP_MB);
+-
+-	HWRM_CHECK_RESULT();
+-
+-	if (rx) {
+-		ring_stats->rx_ucast_pkts = rte_le_to_cpu_64(resp->rx_ucast_pkts);
+-		bnxt_update_prev_stat(&ring_stats->rx_ucast_pkts,
+-				      &prev_stats->rx_ucast_pkts);
+-
+-		ring_stats->rx_mcast_pkts = rte_le_to_cpu_64(resp->rx_mcast_pkts);
+-		bnxt_update_prev_stat(&ring_stats->rx_mcast_pkts,
+-				      &prev_stats->rx_mcast_pkts);
  
-+	/* Second, back-to-back read for the glitch cross-check. */
-+	HWRM_PREP(&req, HWRM_STAT_CTX_QUERY, BNXT_USE_CHIMP_MB);
-+	req.stat_ctx_id = rte_cpu_to_le_32(cpr->hw_stats_ctx_id);
-+	rc = bnxt_hwrm_send_message(bp, &req, sizeof(req), BNXT_USE_CHIMP_MB);
- 	HWRM_CHECK_RESULT();
-+	for (i = 0; i < BNXT_RING_STATS_CNT; i++)
-+		hw2[i] = rte_le_to_cpu_64(((uint64_t *)&resp->tx_ucast_pkts)[i]);
-+	HWRM_UNLOCK();
- 
- 	masks = cpr->ring_stats_mask;
- 	prev_stats_u64 = (uint64_t *)prev_stats;
--	hw_stats = (uint64_t *)&resp->tx_ucast_pkts;
- 	ring_stats_u64 = (uint64_t *)ring_stats;
- 
- 	/* RX stats are >= 8 and TX are < 8 */
- 	for (i = (rx) ? 8 : 0; i < BNXT_RING_STATS_CNT; i++) {
- 		if (!rx && i >= 8)
- 			continue;
--		bnxt_accumulate_ctr(rte_le_to_cpu_64(hw_stats[i]), &prev_stats_u64[i],
--				    masks[i]);
-+
-+		uint64_t hw = bnxt_pick_stat(hw1[i], hw2[i],
-+					     prev_stats_u64[i], masks[i]);
-+
-+		bnxt_accumulate_ctr(hw, &prev_stats_u64[i], masks[i]);
- 		ring_stats_u64[i] = prev_stats_u64[i];
+-		ring_stats->rx_bcast_pkts = rte_le_to_cpu_64(resp->rx_bcast_pkts);
+-		bnxt_update_prev_stat(&ring_stats->rx_bcast_pkts,
+-				      &prev_stats->rx_bcast_pkts);
+-
+-		ring_stats->rx_ucast_bytes = rte_le_to_cpu_64(resp->rx_ucast_bytes);
+-		bnxt_update_prev_stat(&ring_stats->rx_ucast_bytes,
+-				      &prev_stats->rx_ucast_bytes);
+-
+-		ring_stats->rx_mcast_bytes = rte_le_to_cpu_64(resp->rx_mcast_bytes);
+-		bnxt_update_prev_stat(&ring_stats->rx_mcast_bytes,
+-				      &prev_stats->rx_mcast_bytes);
+-
+-		ring_stats->rx_bcast_bytes = rte_le_to_cpu_64(resp->rx_bcast_bytes);
+-		bnxt_update_prev_stat(&ring_stats->rx_bcast_bytes,
+-				      &prev_stats->rx_bcast_bytes);
+-
+-		ring_stats->rx_discard_pkts = rte_le_to_cpu_64(resp->rx_discard_pkts);
+-		bnxt_update_prev_stat(&ring_stats->rx_discard_pkts,
+-				      &prev_stats->rx_discard_pkts);
+-
+-		ring_stats->rx_error_pkts = rte_le_to_cpu_64(resp->rx_error_pkts);
+-		bnxt_update_prev_stat(&ring_stats->rx_error_pkts,
+-				      &prev_stats->rx_error_pkts);
+-
+-		ring_stats->rx_agg_pkts = rte_le_to_cpu_64(resp->rx_agg_pkts);
+-		bnxt_update_prev_stat(&ring_stats->rx_agg_pkts,
+-				      &prev_stats->rx_agg_pkts);
+-
+-		ring_stats->rx_agg_bytes = rte_le_to_cpu_64(resp->rx_agg_bytes);
+-		bnxt_update_prev_stat(&ring_stats->rx_agg_bytes,
+-				      &prev_stats->rx_agg_bytes);
+-
+-		ring_stats->rx_agg_events = rte_le_to_cpu_64(resp->rx_agg_events);
+-		bnxt_update_prev_stat(&ring_stats->rx_agg_events,
+-				      &prev_stats->rx_agg_events);
+-
+-		ring_stats->rx_agg_aborts = rte_le_to_cpu_64(resp->rx_agg_aborts);
+-		bnxt_update_prev_stat(&ring_stats->rx_agg_aborts,
+-				      &prev_stats->rx_agg_aborts);
+-	} else {
+-		ring_stats->tx_ucast_pkts = rte_le_to_cpu_64(resp->tx_ucast_pkts);
+-		bnxt_update_prev_stat(&ring_stats->tx_ucast_pkts,
+-				      &prev_stats->tx_ucast_pkts);
+-
+-		ring_stats->tx_mcast_pkts = rte_le_to_cpu_64(resp->tx_mcast_pkts);
+-		bnxt_update_prev_stat(&ring_stats->tx_mcast_pkts,
+-				      &prev_stats->tx_mcast_pkts);
+-
+-		ring_stats->tx_bcast_pkts = rte_le_to_cpu_64(resp->tx_bcast_pkts);
+-		bnxt_update_prev_stat(&ring_stats->tx_bcast_pkts,
+-				      &prev_stats->tx_bcast_pkts);
+-
+-		ring_stats->tx_ucast_bytes = rte_le_to_cpu_64(resp->tx_ucast_bytes);
+-		bnxt_update_prev_stat(&ring_stats->tx_ucast_bytes,
+-				      &prev_stats->tx_ucast_bytes);
+-
+-		ring_stats->tx_mcast_bytes = rte_le_to_cpu_64(resp->tx_mcast_bytes);
+-		bnxt_update_prev_stat(&ring_stats->tx_mcast_bytes,
+-				      &prev_stats->tx_mcast_bytes);
+-
+-		ring_stats->tx_bcast_bytes = rte_le_to_cpu_64(resp->tx_bcast_bytes);
+-		bnxt_update_prev_stat(&ring_stats->tx_bcast_bytes,
+-				      &prev_stats->tx_bcast_bytes);
+-
+-		ring_stats->tx_discard_pkts = rte_le_to_cpu_64(resp->tx_discard_pkts);
+-		bnxt_update_prev_stat(&ring_stats->tx_discard_pkts,
+-				      &prev_stats->tx_discard_pkts);
++	for (r = 0; r < BNXT_STAT_READS; r++) {
++		HWRM_PREP(&req, HWRM_STAT_CTX_QUERY, BNXT_USE_CHIMP_MB);
++		req.stat_ctx_id = rte_cpu_to_le_32(cid);
++		rc = bnxt_hwrm_send_message(bp, &req, sizeof(req), BNXT_USE_CHIMP_MB);
++		HWRM_CHECK_RESULT();
++		for (i = 0; i < BNXT_RING_STATS_CNT; i++)
++			hw[r][i] = rte_le_to_cpu_64(((uint64_t *)&resp->tx_ucast_pkts)[i]);
++		HWRM_UNLOCK();
  	}
  
 -	HWRM_UNLOCK();
--
++	prev_stats_u64 = (uint64_t *)prev_stats;
++	ring_stats_u64 = (uint64_t *)ring_stats;
++
++	if (rx)
++		bnxt_median_apply(hw[0], hw[1], hw[2], ring_stats_u64,
++				  prev_stats_u64, 8, BNXT_RING_STATS_CNT);
++	else
++		bnxt_median_apply(hw[0], hw[1], hw[2], ring_stats_u64,
++				  prev_stats_u64, 0, 8);
+ 
  	return rc;
  }
- 
-@@ -5587,7 +5617,8 @@ int bnxt_hwrm_ring_stats_ext(struct bnxt *bp, struct bnxt_cp_ring_info *cpr,
- 	struct bnxt_ring_stats_ext *prev_stats = &bp->prev_rx_ring_stats_ext[idx];
+@@ -5533,8 +5499,9 @@ int bnxt_hwrm_ring_stats_ext(struct bnxt *bp, uint32_t cid, int idx,
+ 	int rc = 0;
  	struct hwrm_stat_ext_ctx_query_input req = {.req_type = 0};
  	struct hwrm_stat_ext_ctx_query_output *resp = bp->hwrm_cmd_resp_addr;
--	uint64_t *prev_stats_u64, *hw_stats, *masks, *ring_stats_u64, i;
-+	uint64_t hw1[BNXT_RING_STATS_EXT_CNT], hw2[BNXT_RING_STATS_EXT_CNT];
-+	uint64_t *prev_stats_u64, *masks, *ring_stats_u64, i;
- 	int rc;
+-
+ 	struct bnxt_ring_stats_ext *prev_stats = &bp->prev_rx_ring_stats_ext[idx];
++	uint64_t hw[BNXT_STAT_READS][BNXT_RING_STATS_EXT_CNT];
++	uint64_t *prev_stats_u64, *ring_stats_u64, i, r;
  
  	if (!rx)
-@@ -5601,29 +5632,41 @@ int bnxt_hwrm_ring_stats_ext(struct bnxt *bp, struct bnxt_cp_ring_info *cpr,
+ 		prev_stats = &bp->prev_tx_ring_stats_ext[idx];
+@@ -5547,105 +5514,30 @@ int bnxt_hwrm_ring_stats_ext(struct bnxt *bp, uint32_t cid, int idx,
  
  		return 0;
  	}
 -	HWRM_PREP(&req, HWRM_STAT_EXT_CTX_QUERY, BNXT_USE_CHIMP_MB);
  
-+	/* First read. */
-+	HWRM_PREP(&req, HWRM_STAT_EXT_CTX_QUERY, BNXT_USE_CHIMP_MB);
- 	req.stat_ctx_id = rte_cpu_to_le_32(cpr->hw_stats_ctx_id);
- 	rc = bnxt_hwrm_send_message(bp, &req, sizeof(req), BNXT_USE_CHIMP_MB);
-+	HWRM_CHECK_RESULT();
-+	for (i = 0; i < BNXT_RING_STATS_EXT_CNT; i++)
-+		hw1[i] = rte_le_to_cpu_64(((uint64_t *)&resp->rx_ucast_pkts)[i]);
-+	HWRM_UNLOCK();
+-	req.stat_ctx_id = rte_cpu_to_le_32(cid);
+-	rc = bnxt_hwrm_send_message(bp, &req, sizeof(req), BNXT_USE_CHIMP_MB);
++	for (r = 0; r < BNXT_STAT_READS; r++) {
++		HWRM_PREP(&req, HWRM_STAT_EXT_CTX_QUERY, BNXT_USE_CHIMP_MB);
++		req.stat_ctx_id = rte_cpu_to_le_32(cid);
++		rc = bnxt_hwrm_send_message(bp, &req, sizeof(req), BNXT_USE_CHIMP_MB);
++		HWRM_CHECK_RESULT();
++		for (i = 0; i < BNXT_RING_STATS_EXT_CNT; i++)
++			hw[r][i] = rte_le_to_cpu_64(((uint64_t *)&resp->rx_ucast_pkts)[i]);
++		HWRM_UNLOCK();
++	}
  
-+	/* Second, back-to-back read for the glitch cross-check. */
-+	HWRM_PREP(&req, HWRM_STAT_EXT_CTX_QUERY, BNXT_USE_CHIMP_MB);
-+	req.stat_ctx_id = rte_cpu_to_le_32(cpr->hw_stats_ctx_id);
-+	rc = bnxt_hwrm_send_message(bp, &req, sizeof(req), BNXT_USE_CHIMP_MB);
- 	HWRM_CHECK_RESULT();
-+	for (i = 0; i < BNXT_RING_STATS_EXT_CNT; i++)
-+		hw2[i] = rte_le_to_cpu_64(((uint64_t *)&resp->rx_ucast_pkts)[i]);
-+	HWRM_UNLOCK();
+-	HWRM_CHECK_RESULT();
++	prev_stats_u64 = (uint64_t *)prev_stats;
++	ring_stats_u64 = (uint64_t *)ring_stats;
  
- 	masks = cpr->ring_stats_ext_mask;
- 	prev_stats_u64 = (uint64_t *)prev_stats;
--	hw_stats = (uint64_t *)&resp->rx_ucast_pkts;
- 	ring_stats_u64 = (uint64_t *)ring_stats;
- 
- 	/* RX stats are < 8 and >= 16 and TX are >= 8 and < 16*/
- 	for (i = (rx) ? 0 : 8; i < BNXT_RING_STATS_EXT_CNT; i++) {
- 		if ((rx && (i >= 8 && i < 16)) || (!rx && i >= 16))
- 			continue;
--		bnxt_accumulate_ctr(rte_le_to_cpu_64(hw_stats[i]), &prev_stats_u64[i],
--				    masks[i]);
-+
-+		uint64_t hw = bnxt_pick_stat(hw1[i], hw2[i],
-+					     prev_stats_u64[i], masks[i]);
-+
-+		bnxt_accumulate_ctr(hw, &prev_stats_u64[i], masks[i]);
- 		ring_stats_u64[i] = prev_stats_u64[i];
+ 	if (rx) {
+-		ring_stats->rx_ucast_pkts = rte_le_to_cpu_64(resp->rx_ucast_pkts);
+-		bnxt_update_prev_stat(&ring_stats->rx_ucast_pkts,
+-				      &prev_stats->rx_ucast_pkts);
+-
+-		ring_stats->rx_mcast_pkts = rte_le_to_cpu_64(resp->rx_mcast_pkts);
+-		bnxt_update_prev_stat(&ring_stats->rx_mcast_pkts,
+-				      &prev_stats->rx_mcast_pkts);
+-
+-		ring_stats->rx_bcast_pkts = rte_le_to_cpu_64(resp->rx_bcast_pkts);
+-		bnxt_update_prev_stat(&ring_stats->rx_bcast_pkts,
+-				      &prev_stats->rx_bcast_pkts);
+-
+-		ring_stats->rx_ucast_bytes = rte_le_to_cpu_64(resp->rx_ucast_bytes);
+-		bnxt_update_prev_stat(&ring_stats->rx_ucast_bytes,
+-				      &prev_stats->rx_ucast_bytes);
+-
+-		ring_stats->rx_mcast_bytes = rte_le_to_cpu_64(resp->rx_mcast_bytes);
+-		bnxt_update_prev_stat(&ring_stats->rx_mcast_bytes,
+-				      &prev_stats->rx_mcast_bytes);
+-
+-		ring_stats->rx_bcast_bytes = rte_le_to_cpu_64(resp->rx_bcast_bytes);
+-		bnxt_update_prev_stat(&ring_stats->rx_bcast_bytes,
+-				      &prev_stats->rx_bcast_bytes);
+-
+-		ring_stats->rx_discard_pkts = rte_le_to_cpu_64(resp->rx_discard_pkts);
+-		bnxt_update_prev_stat(&ring_stats->rx_discard_pkts,
+-				      &prev_stats->rx_discard_pkts);
+-
+-		ring_stats->rx_error_pkts = rte_le_to_cpu_64(resp->rx_error_pkts);
+-		bnxt_update_prev_stat(&ring_stats->rx_error_pkts,
+-				      &prev_stats->rx_error_pkts);
+-
+-		ring_stats->rx_tpa_eligible_pkt = rte_le_to_cpu_64(resp->rx_tpa_eligible_pkt);
+-		bnxt_update_prev_stat(&ring_stats->rx_tpa_eligible_pkt,
+-				      &prev_stats->rx_tpa_eligible_pkt);
+-
+-		ring_stats->rx_tpa_eligible_bytes = rte_le_to_cpu_64(resp->rx_tpa_eligible_bytes);
+-		bnxt_update_prev_stat(&ring_stats->rx_tpa_eligible_bytes,
+-				      &prev_stats->rx_tpa_eligible_bytes);
+-
+-		ring_stats->rx_tpa_pkt = rte_le_to_cpu_64(resp->rx_tpa_pkt);
+-		bnxt_update_prev_stat(&ring_stats->rx_tpa_pkt,
+-				      &prev_stats->rx_tpa_pkt);
+-
+-		ring_stats->rx_tpa_bytes = rte_le_to_cpu_64(resp->rx_tpa_bytes);
+-		bnxt_update_prev_stat(&ring_stats->rx_tpa_bytes,
+-				      &prev_stats->rx_tpa_bytes);
+-
+-		ring_stats->rx_tpa_errors = rte_le_to_cpu_64(resp->rx_tpa_errors);
+-		bnxt_update_prev_stat(&ring_stats->rx_tpa_errors,
+-				      &prev_stats->rx_tpa_errors);
+-
+-		ring_stats->rx_tpa_events = rte_le_to_cpu_64(resp->rx_tpa_events);
+-		bnxt_update_prev_stat(&ring_stats->rx_tpa_events,
+-				      &prev_stats->rx_tpa_events);
++		bnxt_median_apply(hw[0], hw[1], hw[2], ring_stats_u64,
++				  prev_stats_u64, 0, 8);
++		bnxt_median_apply(hw[0], hw[1], hw[2], ring_stats_u64,
++				  prev_stats_u64, 16, BNXT_RING_STATS_EXT_CNT);
+ 	} else {
+-		ring_stats->tx_ucast_pkts = rte_le_to_cpu_64(resp->tx_ucast_pkts);
+-		bnxt_update_prev_stat(&ring_stats->tx_ucast_pkts,
+-				      &prev_stats->tx_ucast_pkts);
+-
+-		ring_stats->tx_mcast_pkts = rte_le_to_cpu_64(resp->tx_mcast_pkts);
+-		bnxt_update_prev_stat(&ring_stats->tx_mcast_pkts,
+-				      &prev_stats->tx_mcast_pkts);
+-
+-		ring_stats->tx_bcast_pkts = rte_le_to_cpu_64(resp->tx_bcast_pkts);
+-		bnxt_update_prev_stat(&ring_stats->tx_bcast_pkts,
+-				      &prev_stats->tx_bcast_pkts);
+-
+-		ring_stats->tx_ucast_bytes = rte_le_to_cpu_64(resp->tx_ucast_bytes);
+-		bnxt_update_prev_stat(&ring_stats->tx_ucast_bytes,
+-				      &prev_stats->tx_ucast_bytes);
+-
+-		ring_stats->tx_mcast_bytes = rte_le_to_cpu_64(resp->tx_mcast_bytes);
+-		bnxt_update_prev_stat(&ring_stats->tx_mcast_bytes,
+-				      &prev_stats->tx_mcast_bytes);
+-
+-		ring_stats->tx_bcast_bytes = rte_le_to_cpu_64(resp->tx_bcast_bytes);
+-		bnxt_update_prev_stat(&ring_stats->tx_bcast_bytes,
+-				      &prev_stats->tx_bcast_bytes);
+-
+-		ring_stats->tx_discard_pkts = rte_le_to_cpu_64(resp->tx_discard_pkts);
+-		bnxt_update_prev_stat(&ring_stats->tx_discard_pkts,
+-				      &prev_stats->tx_discard_pkts);
+-
+-		ring_stats->tx_error_pkts = rte_le_to_cpu_64(resp->tx_error_pkts);
+-		bnxt_update_prev_stat(&ring_stats->tx_error_pkts,
+-				      &prev_stats->tx_error_pkts);
++		bnxt_median_apply(hw[0], hw[1], hw[2], ring_stats_u64,
++				  prev_stats_u64, 8, 16);
  	}
  
 -	HWRM_UNLOCK();
@@ -225,6 +301,3 @@ index c1332f796b..d567a51a6e 100644
  	return rc;
  }
  
--- 
-2.54.0
-
