@@ -24,7 +24,7 @@ index ac5cbbae0c..cdf65f0d45 100644
 +	uint64_t smax = RTE_MAX(RTE_MAX(a, b), c);
 +
 +	if (smax - smin > (1ULL << 28))
-+		PMD_DRV_LOG_LINE(NOTICE,
++		PMD_DRV_LOG_LINE(DEBUG,
 +			"STATS xcheck: r1=0x%llx r2=0x%llx r3=0x%llx prev=0x%llx -> 0x%llx",
 +			(unsigned long long)a, (unsigned long long)b,
 +			(unsigned long long)c, (unsigned long long)prev,
